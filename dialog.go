@@ -14,6 +14,14 @@ var (
 	ErrDialogDoesNotExists   = errors.New("Call/Transaction Does Not Exist")
 	ErrDialogInviteNoContact = errors.New("no Contact header")
 	ErrDialogInvalidCseq     = errors.New("invalid CSEQ number")
+	// ErrDialogEnded indicates an operation or ACK received after terminal state.
+	ErrDialogEnded = errors.New("dialog has ended")
+	// ErrDialogAckTimeout indicates that no ACK arrived within RFC 6026 Timer L.
+	ErrDialogAckTimeout = errors.New("dialog ACK wait timed out")
+	// ErrDialogInvalidContext indicates a nil context on a context-aware operation.
+	ErrDialogInvalidContext = errors.New("dialog context is required")
+	// ErrDialogInvalidState indicates an impossible dialog transition.
+	ErrDialogInvalidState = errors.New("invalid dialog state")
 )
 
 type ErrDialogResponse struct {
@@ -107,6 +115,22 @@ func (d *Dialog) setState(s sip.DialogState) {
 		cb := *f
 		cb(s)
 	}
+}
+
+func (d *Dialog) compareAndSetState(old, next sip.DialogState, cause error) bool {
+	// ACK, CANCEL, and caller cancellation all race at the final-response boundary. A CAS makes the
+	// first committed transition terminal and prevents late events from resurrecting the dialog.
+	if !d.state.CompareAndSwap(int32(old), int32(next)) {
+		return false
+	}
+	if next == sip.DialogStateEnded {
+		d.cancel(cause)
+	}
+	if f := d.onStatePointer.Load(); f != nil {
+		callback := *f
+		callback(next)
+	}
+	return true
 }
 
 // endWithCause sets dialog state ended and place context cause error
