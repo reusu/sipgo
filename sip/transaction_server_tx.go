@@ -3,6 +3,7 @@ package sip
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -102,6 +103,9 @@ func (tx *ServerTx) Receive(req *Request) error {
 }
 
 func (tx *ServerTx) Respond(res *Response) error {
+	if strings.ContainsAny(res.Reason, "\r\n") {
+		return fmt.Errorf("invalid CRLF in response reason")
+	}
 	if res.IsCancel() {
 		return tx.conn.WriteMsg(res)
 	}

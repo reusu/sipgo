@@ -128,6 +128,8 @@ func TestServerTransactionRespondRejectsCRLF(t *testing.T) {
 		},
 	}
 	tx := NewServerTx("123", req, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
 
 	res := NewResponseFromRequest(req, StatusOK, "OK\r\nInjected", nil)
 	err := tx.Respond(res)
