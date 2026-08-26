@@ -26,8 +26,22 @@ func (s *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction
 	if req.CSeq().SeqNo != s.remoteCSeqNo.Load() {
 		return ErrDialogInvalidCseq
 	}
-	s.setState(sip.DialogStateConfirmed)
-	return nil
+	state := s.LoadState()
+	for {
+		switch state {
+		case sip.DialogStateEnded:
+			return ErrDialogEnded
+		case sip.DialogStateConfirmed:
+			return nil
+		case sip.DialogStateEstablished:
+			if s.compareAndSetState(sip.DialogStateEstablished, sip.DialogStateConfirmed, nil) {
+				return nil
+			}
+			state = s.LoadState()
+		default:
+			return fmt.Errorf("%w: cannot confirm %s dialog", ErrDialogInvalidState, state)
+		}
+	}
 }
 
 func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
@@ -196,6 +210,18 @@ func (s *DialogServerSession) Close() error {
 //
 // In case Cancel request received: ErrDialogCanceled is responded
 func (s *DialogServerSession) Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error {
+	return s.RespondContext(context.Background(), statusCode, reason, body, headers...)
+}
+
+// RespondContext builds and writes an INVITE response while allowing final-response ACK waiting to
+// be canceled. Provisional responses only observe cancellation before transmission.
+func (s *DialogServerSession) RespondContext(
+	ctx context.Context,
+	statusCode int,
+	reason string,
+	body []byte,
+	headers ...sip.Header,
+) error {
 	// Must copy Record-Route headers. Done by this command
 	res := sip.NewResponseFromRequest(s.InviteRequest, statusCode, reason, body)
 
@@ -203,17 +229,22 @@ func (s *DialogServerSession) Respond(statusCode int, reason string, body []byte
 		res.AppendHeader(h)
 	}
 
-	return s.WriteResponse(res)
+	return s.WriteResponseContext(ctx, res)
 }
 
 // RespondSDP is just wrapper to call 200 with SDP.
 // It is better to use this when answering as it provide correct headers
 func (s *DialogServerSession) RespondSDP(sdp []byte) error {
+	return s.RespondSDPContext(context.Background(), sdp)
+}
+
+// RespondSDPContext writes a 200 SDP response and bounds the subsequent ACK wait by ctx.
+func (s *DialogServerSession) RespondSDPContext(ctx context.Context, sdp []byte) error {
 	if sdp == nil {
 		return fmt.Errorf("sdp not provided")
 	}
 	res := sip.NewSDPResponseFromRequest(s.InviteRequest, sdp)
-	return s.WriteResponse(res)
+	return s.WriteResponseContext(ctx, res)
 }
 
 var errDialogUnauthorized = errors.New("unathorized")
@@ -259,6 +290,18 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 // NOTE: Make sure you have built response based on dialog.InviteRequest which makes sure
 // that dialog ID do match
 func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
+	return s.WriteResponseContext(context.Background(), res)
+}
+
+// WriteResponseContext writes an INVITE response. For final responses, ctx bounds ACK waiting and
+// retransmission. Cancellation after transmission terminates both transaction and dialog.
+func (s *DialogServerSession) WriteResponseContext(ctx context.Context, res *sip.Response) error {
+	if ctx == nil {
+		return ErrDialogInvalidContext
+	}
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
 	tx := s.inviteTx
 
 	if res.Contact() == nil {
@@ -292,6 +335,11 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		case <-tx.Acks():
 		case <-tx.Done():
 			// This means tx moved to terminated state and no more invite retransmissions is accepted
+		case <-ctx.Done():
+			cause := context.Cause(ctx)
+			s.endWithCause(cause)
+			tx.Terminate()
+			return cause
 		}
 		s.setState(sip.DialogStateEnded)
 		return nil
@@ -306,47 +354,96 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		return fmt.Errorf("ID do not match. Invite request has changed headers?")
 	}
 
-	s.setState(sip.DialogStateEstablished)
-
 	// Register dialog state read channel before transmitting 200 OK. This prevents a race
 	// condition where the ACK is received before we start waiting for it.
 	readStateCh := s.StateRead()
+	if !s.compareAndSetState(sip.DialogStateInitial, sip.DialogStateEstablished, nil) {
+		state := s.LoadState()
+		if state == sip.DialogStateEnded {
+			if cause := s.err(); cause != nil {
+				return cause
+			}
+			return ErrDialogEnded
+		}
+		return fmt.Errorf("%w: cannot establish %s dialog", ErrDialogInvalidState, state)
+	}
 
 	if err := tx.Respond(res); err != nil {
+		if s.compareAndSetState(sip.DialogStateEstablished, sip.DialogStateEnded, err) {
+			tx.Terminate()
+		}
 		return err
 	}
 
 	// Wait now for ACK for our 2xx
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
 
-	// We are following RFC 6026, which states that this is TU thing and not Transaction layer.
-	timer := time.NewTimer(sip.T1)
-	defer timer.Stop()
+	// RFC 6026 makes 2xx retransmission a transaction-user responsibility. Keep one overall ACK
+	// timer; recreating it on every retransmission would extend the 64*T1 bound indefinitely.
+	retransmitTimer := time.NewTimer(sip.T1)
+	defer retransmitTimer.Stop()
+	ackTimer := time.NewTimer(sip.Timer_L)
+	defer ackTimer.Stop()
+	retransmitInterval := sip.T1
 
 	state := sip.DialogStateEstablished
 	for state == sip.DialogStateEstablished {
 		select {
-		case <-timer.C:
+		case <-ctx.Done():
+			cause := context.Cause(ctx)
+			if s.compareAndSetState(sip.DialogStateEstablished, sip.DialogStateEnded, cause) {
+				tx.Terminate()
+				return cause
+			}
+			if s.LoadState() == sip.DialogStateConfirmed {
+				return nil
+			}
+			return ErrDialogEnded
+		case <-tx.Done():
+			cause := tx.Err()
+			if cause == nil {
+				cause = sip.ErrTransactionTerminated
+			}
+			if s.compareAndSetState(sip.DialogStateEstablished, sip.DialogStateEnded, cause) {
+				return cause
+			}
+			if s.LoadState() == sip.DialogStateConfirmed {
+				return nil
+			}
+			return ErrDialogEnded
+		case <-retransmitTimer.C:
 			if err := tx.Respond(res); err != nil {
+				if s.compareAndSetState(sip.DialogStateEstablished, sip.DialogStateEnded, err) {
+					tx.Terminate()
+				}
 				return err
 			}
 			// 2xx response is passed to the transport with an
 			//    interval that starts at T1 seconds and doubles for each
 			//    retransmission until it reaches T2 seconds (T1 and T2 are defined in
 			//    Section 17).
-			timer.Reset(max(2*sip.T1, sip.T2))
+			retransmitInterval = min(2*retransmitInterval, sip.T2)
+			retransmitTimer.Reset(retransmitInterval)
 
-		case <-time.After(64 * sip.T1):
-			// If the server retransmits the 2xx response for 64*T1 seconds without
-			// receiving an ACK, the dialog is confirmed, but the session SHOULD be
-			// terminated.  This is accomplished with a BYE, as described in Section
-			// 15.
-			state = sip.DialogStateConfirmed
+		case <-ackTimer.C:
+			// No ACK arrived within the RFC 6026 Timer L window. Stop 2xx retransmission
+			// and fail closed locally; higher layers may record the explicit cause.
+			if s.compareAndSetState(sip.DialogStateEstablished, sip.DialogStateEnded, ErrDialogAckTimeout) {
+				tx.Terminate()
+				return ErrDialogAckTimeout
+			}
+			if s.LoadState() == sip.DialogStateConfirmed {
+				return nil
+			}
+			return ErrDialogEnded
 		case state = <-readStateCh:
 		}
 	}
 	if state != sip.DialogStateConfirmed {
-		return fmt.Errorf("No ACK received")
+		if state == sip.DialogStateEnded {
+			return ErrDialogEnded
+		}
+		return fmt.Errorf("unexpected dialog state while waiting for ACK: %s", state)
 	}
 	return nil
 }
