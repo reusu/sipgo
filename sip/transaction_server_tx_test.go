@@ -29,6 +29,7 @@ func TestServerTransactionFSM(t *testing.T) {
 		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
+		t.Cleanup(tx.Terminate)
 
 		err = tx.Receive(req)
 		require.NoError(t, err)
@@ -51,6 +52,7 @@ func TestServerTransactionFSM(t *testing.T) {
 		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
+		t.Cleanup(tx.Terminate)
 
 		// We received Cancel while dealing with resposn
 
@@ -84,6 +86,7 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
+		t.Cleanup(tx.Terminate)
 
 		err = tx.Receive(req)
 		require.NoError(t, err)
@@ -138,12 +141,44 @@ func TestServerTransactionRespondRejectsCRLF(t *testing.T) {
 	require.Empty(t, outgoing.String())
 }
 
+func TestServerTransactionTerminateGracefullyDoesNotWaitForUnreliableTimer(t *testing.T) {
+	req := testCreateRequest(t, "OPTIONS", "sip:example.com", "UDP", "127.0.0.1:5060")
+	conn := &UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Writers: map[string]io.Writer{"127.0.0.1:5060": bytes.NewBuffer(nil)},
+		},
+	}
+	tx := NewServerTx("graceful-nonblocking", req, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	t.Cleanup(tx.Terminate)
+	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+
+	returned := make(chan struct{})
+	go func() {
+		tx.TerminateGracefully()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		tx.Terminate()
+		t.Fatal("graceful termination blocked on the unreliable transaction timer")
+	}
+	select {
+	case <-tx.Done():
+		t.Fatal("graceful termination stopped retransmission before its timer")
+	default:
+	}
+}
+
 func TestServerTransactionFSMInvite(t *testing.T) {
 	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 
 	incoming := bytes.NewBuffer([]byte{})
 	outgoing := bytes.NewBuffer([]byte{})
 	t.Run("InviteCancel", func(t *testing.T) {
+		oldTimerI := Timer_I
+		t.Cleanup(func() { Timer_I = oldTimerI })
 		Timer_I = 10 * time.Millisecond
 		conn := &UDPConnection{
 			PacketConn: &fakes.UDPConn{

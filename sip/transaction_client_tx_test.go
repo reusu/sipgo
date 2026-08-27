@@ -15,6 +15,8 @@ import (
 
 func TestClientTransactionInviteFSM(t *testing.T) {
 	// make things fast
+	oldT1, oldT2, oldT4 := T1, T2, T4
+	t.Cleanup(func() { SetTimers(oldT1, oldT2, oldT4) })
 	SetTimers(1*time.Millisecond, 1*time.Millisecond, 1*time.Millisecond)
 	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 	req.raddr = Addr{IP: net.ParseIP("127.0.0.99"), Port: 5060}

@@ -169,7 +169,8 @@ func (tx *ServerTx) Terminate() {
 	}
 }
 
-// TerminateGracefully allows retransmission to happen before shuting down transaction
+// TerminateGracefully leaves finalized unreliable transactions alive for their retransmission
+// timers while allowing the caller to return.
 func (tx *ServerTx) TerminateGracefully() {
 	if tx.reliable {
 		// reliable transports have no retransmission, so it is better just to terminate
@@ -185,8 +186,7 @@ func (tx *ServerTx) TerminateGracefully() {
 		tx.Terminate()
 		return
 	}
-	tx.log.Debug("Server transaction waiting termination")
-	<-tx.Done()
+	tx.log.Debug("Server transaction retained for timer termination")
 }
 
 // OnCancel is experimental
