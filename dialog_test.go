@@ -32,6 +32,24 @@ func TestDialogState(t *testing.T) {
 
 }
 
+func TestDialogOnStateReplayObservesForkCASTransition(t *testing.T) {
+	inv, _, _ := createTestInvite(t, "sip:nowhere", "udp", "127.0.0.1")
+	dialog := Dialog{InviteRequest: inv}
+	dialog.Init()
+	states := make(chan sip.DialogState, 2)
+	if got := dialog.OnStateReplay(func(state sip.DialogState) { states <- state }); got != sip.DialogStateInitial {
+		t.Fatalf("replayed state = %s", got)
+	}
+	if !dialog.compareAndSetState(sip.DialogStateInitial, sip.DialogStateEstablished, nil) {
+		t.Fatal("fork CAS transition failed")
+	}
+	for _, want := range []sip.DialogState{sip.DialogStateInitial, sip.DialogStateEstablished} {
+		if got := <-states; got != want {
+			t.Fatalf("callback state = %s, want %s", got, want)
+		}
+	}
+}
+
 func BenchmarkDialogSettingState(b *testing.B) {
 	inv, _, _ := createTestInvite(b, "sip:nowhere", "udp", "127.0.0.1")
 	d := Dialog{
