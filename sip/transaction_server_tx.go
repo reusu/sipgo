@@ -29,8 +29,9 @@ func NewServerTx(key string, origin *Request, conn Connection, logger *slog.Logg
 	tx.key = key
 	tx.conn = conn
 
-	// about ~10 retransmits
-	tx.acks = make(chan *Request)
+	// One logical non-2xx ACK is enough for the transaction user. Buffering it lets middleware send
+	// a final response without starting a goroutine merely because no caller consumes Acks.
+	tx.acks = make(chan *Request, 1)
 	// tx.cancels = make(chan *Request)
 	tx.done = make(chan struct{})
 	tx.log = logger
@@ -131,32 +132,23 @@ func (tx *ServerTx) Respond(res *Response) error {
 	return tx.Err()
 }
 
-// Acks makes channel for sending acks. Channel is created on demand
+// Acks returns the one-slot optional mailbox for a non-2xx INVITE ACK.
 func (tx *ServerTx) Acks() <-chan *Request {
 	return tx.acks
 }
 
-func (tx *ServerTx) ackSend(r *Request) {
-	select {
-	case <-tx.done:
-		callID := ""
-		if h := r.CallID(); h != nil {
-			callID = h.Value()
-		}
-		tx.log.Warn("ACK missed", "callid", callID, "tx", tx.Key())
-	case tx.acks <- r:
-	}
-}
-
 func (tx *ServerTx) ackSendAsync(r *Request) {
 	select {
-	case tx.acks <- r:
+	case <-tx.done:
 		return
 	default:
 	}
-
-	// Go routines should be cheap and it will prevent blocking
-	go tx.ackSend(r)
+	select {
+	case tx.acks <- r:
+	default:
+		// A pending ACK already proves the transition. Later packets are retransmissions and must not
+		// create waiters when the transaction user intentionally ignores the optional mailbox.
+	}
 }
 
 func (tx *ServerTx) Terminate() {

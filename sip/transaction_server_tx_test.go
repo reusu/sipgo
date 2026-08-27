@@ -217,16 +217,19 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 	})
 }
 
-func TestServerTransactionAckSendMissingCallID(t *testing.T) {
+func TestServerTransactionAckMailboxIsBoundedWithoutConsumer(t *testing.T) {
 	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 	tx := NewServerTx("123", req, nil, slog.Default())
 	ack := NewRequest(ACK, req.Recipient)
 
-	close(tx.done)
+	tx.ackSendAsync(ack)
+	tx.ackSendAsync(ack)
+	require.Len(t, tx.acks, 1)
+	require.Same(t, ack, <-tx.Acks())
 
-	require.NotPanics(t, func() {
-		tx.ackSend(ack)
-	})
+	close(tx.done)
+	tx.ackSendAsync(ack)
+	require.Empty(t, tx.acks)
 }
 
 func TestServerTransactionContext(t *testing.T) {
