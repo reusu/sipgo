@@ -218,6 +218,9 @@ func (d *DialogClientSession) Invite(ctx context.Context, options ...ClientReque
 
 type AnswerOptions struct {
 	OnResponse func(res *sip.Response) error
+	// ValidateChallenge receives a detached 401 or 407 response before Digest credentials are
+	// applied. Returning an error aborts the dialog without sending Authorization material.
+	ValidateChallenge func(res *sip.Response) error
 
 	// For digest authentication
 	Username string
@@ -264,20 +267,6 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 			return errors.Join(fmt.Errorf("transaction terminated"), tx.Err())
 		}
 
-		if opts.OnResponse != nil {
-			if err := opts.OnResponse(r); err != nil {
-				return err
-			}
-		}
-
-		if r.IsSuccess() {
-			break
-		}
-
-		if r.IsProvisional() {
-			continue
-		}
-
 		var proxyAuth bool
 		var hasChallenge bool
 		switch r.StatusCode {
@@ -290,6 +279,25 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 			if r.GetHeader("WWW-Authenticate") != nil {
 				hasChallenge = true
 			}
+		}
+		if hasChallenge && opts.ValidateChallenge != nil {
+			if err := opts.ValidateChallenge(r.Clone()); err != nil {
+				return err
+			}
+		}
+
+		if opts.OnResponse != nil {
+			if err := opts.OnResponse(r); err != nil {
+				return err
+			}
+		}
+
+		if r.IsSuccess() {
+			break
+		}
+
+		if r.IsProvisional() {
+			continue
 		}
 
 		if opts.Password != "" && hasChallenge && authAttempts < maxAuthAttempts {
@@ -488,11 +496,11 @@ func newAckRequestUAC(inviteRequest *sip.Request, inviteResponse *sip.Response, 
 	ackRequest.SipVersion = inviteRequest.SipVersion
 
 	// ACK to 2xx response should not copy over Route header(s) from original INVITE request.
-	// Instead the ACK should include Route header(s) derived from reversing the order of 
-	// Record-Route header(s) in the 2xx response. 
+	// Instead the ACK should include Route header(s) derived from reversing the order of
+	// Record-Route header(s) in the 2xx response.
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-12.1.2
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-12.2.1.1
-	
+
 	if h := inviteRequest.From(); h != nil {
 		ackRequest.AppendHeader(sip.HeaderClone(h))
 	}
@@ -553,9 +561,9 @@ func newByeRequestUAC(inviteRequest *sip.Request, inviteResponse *sip.Response, 
 	)
 	byeRequest.SipVersion = inviteRequest.SipVersion
 
-	// For the UAC side, the Route header field(s) in the BYE request are constructed from reversing the order 
+	// For the UAC side, the Route header field(s) in the BYE request are constructed from reversing the order
 	// of Record-Route header field(s) in the dialogue-establishing INVITE response such as a 2xx response.
-	// For the UAS side, the dialog route set is the list of Record-Route header fields from the 
+	// For the UAS side, the dialog route set is the list of Record-Route header fields from the
 	// dialogue-establishing INVITE request, taken in the same order.
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-12.1.1
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-12.1.2
