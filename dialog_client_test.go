@@ -3,6 +3,7 @@ package sipgo
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -303,6 +304,52 @@ func TestDialogClientACKRetransmission(t *testing.T) {
 	state := d.LoadState()
 	assert.Equal(t, sip.DialogStateConfirmed, state)
 	assert.EqualValues(t, 3, atomic.LoadInt32(&acks))
+}
+
+func TestDialogClientCancelLosingToSuccessCommitsResponseForACK(t *testing.T) {
+	cancelSeen := make(chan struct{})
+	firstACK := make(chan struct{})
+	var cancelOnce sync.Once
+	var ackOnce sync.Once
+	var acks atomic.Int32
+	client := testClientResponder(t, func(req *sip.Request, responder *siptest.ClientTxResponder) {
+		switch req.Method {
+		case sip.INVITE:
+			responder.Receive(sip.NewResponseFromRequest(req, sip.StatusRinging, "Ringing", nil))
+			<-cancelSeen
+			success := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+			responder.Receive(success)
+			<-firstACK
+			responder.Receive(success)
+		case sip.CANCEL:
+			cancelOnce.Do(func() { close(cancelSeen) })
+			responder.Receive(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+		case sip.ACK:
+			acks.Add(1)
+			ackOnce.Do(func() { close(firstACK) })
+		}
+	})
+	dialogUA := DialogUA{Client: client}
+	dialog, err := dialogUA.Invite(
+		context.Background(), sip.Uri{User: "test", Host: "localhost"}, nil,
+	)
+	require.NoError(t, err)
+	defer dialog.Close()
+	waitContext, cancel := context.WithCancel(context.Background())
+	err = dialog.WaitAnswer(waitContext, AnswerOptions{OnResponse: func(response *sip.Response) error {
+		if response.StatusCode == sip.StatusRinging {
+			cancel()
+		}
+		return nil
+	}})
+	require.NoError(t, err)
+	require.NotNil(t, dialog.InviteResponse)
+	assert.Equal(t, sip.StatusOK, dialog.InviteResponse.StatusCode)
+	assert.Equal(t, sip.DialogStateEstablished, dialog.LoadState())
+	require.NoError(t, dialog.Ack(context.Background()))
+	assert.Equal(t, sip.DialogStateConfirmed, dialog.LoadState())
+	require.Eventually(t, func() bool { return acks.Load() == 2 }, time.Second, time.Millisecond)
+	assert.EqualValues(t, 2, acks.Load())
 }
 
 func BenchmarkDialogDo(b *testing.B) {

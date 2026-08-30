@@ -260,8 +260,11 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 			// https://datatracker.ietf.org/doc/html/rfc3261#section-9.1
 			// Cancel can only be sent when provisional is received
 			// We will wait until transaction timeous out (TimerB)
-			defer tx.Terminate()
-			return s.inviteCancel(ctx, tx)
+			cancelErr := s.inviteCancel(ctx, tx)
+			if cancelErr != nil {
+				tx.Terminate()
+			}
+			return cancelErr
 		case <-tx.Done():
 			// tx.Err() can be empty
 			return errors.Join(fmt.Errorf("transaction terminated"), tx.Err())
@@ -331,15 +334,7 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 		return &ErrDialogResponse{Res: r}
 	}
 
-	id, err := sip.DialogIDFromResponse(r)
-	if err != nil {
-		return err
-	}
-	s.inviteTx = tx
-	s.InviteResponse = r
-	s.ID = id
-	s.setState(sip.DialogStateEstablished)
-	return nil
+	return s.commitInviteSuccess(tx, r)
 }
 
 func (s *DialogClientSession) inviteCancel(ctx context.Context, tx sip.ClientTransaction) error {
@@ -387,13 +382,31 @@ loop_487:
 			s.InviteResponse = r
 			break loop_487
 		case <-tx.Done():
-			return tx.Err()
+			return errors.Join(fmt.Errorf("transaction terminated during CANCEL"), tx.Err())
 		case <-time.After(64 * sip.T1):
 			break loop_487
 		}
 	}
+	if r != nil && r.IsSuccess() {
+		// RFC 3261 Section 9.1 requires the UAC to accept a 2xx that wins the CANCEL race.
+		// Commit the dialog so the caller can send ACK followed by BYE instead of returning a
+		// cancellation error that leaves the successful INVITE response unacknowledged.
+		return s.commitInviteSuccess(tx, r)
+	}
 
 	return ctx.Err()
+}
+
+func (s *DialogClientSession) commitInviteSuccess(tx sip.ClientTransaction, response *sip.Response) error {
+	id, err := sip.DialogIDFromResponse(response)
+	if err != nil {
+		return err
+	}
+	s.inviteTx = tx
+	s.InviteResponse = response
+	s.ID = id
+	s.setState(sip.DialogStateEstablished)
+	return nil
 }
 
 // Ack sends ack. Use WriteAck for more customizing
