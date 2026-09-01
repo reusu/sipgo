@@ -187,7 +187,9 @@ func (t *TransportWS) initConnection(conn net.Conn, raddr string, clientSide boo
 // This should performe better to avoid any interface allocation
 func (t *TransportWS) readConnection(conn *WSConnection, laddr string, raddr string, handler MessageHandler) {
 	log := t.log
-	buf := make([]byte, TransportBufferReadSize)
+	// RFC 7118 section 5 preserves one complete SIP message per WebSocket message. The generic
+	// stream buffer is smaller than ParseMaxMessageLength, so WS/WSS needs the full parser bound.
+	buf := make([]byte, ParseMaxMessageLength)
 	// defer conn.Close()
 	// defer t.pool.Del(raddr)
 	defer t.pool.Delete(laddr)
@@ -399,57 +401,34 @@ func (c *WSConnection) Read(b []byte) (n int, err error) {
 		}
 
 		if header.OpCode.IsControl() {
-			if header.OpCode == ws.OpClose {
-				return n, net.ErrClosed
+			handler := wsutil.ControlHandler{
+				Src: reader, Dst: c.Conn, State: state, DisableSrcCiphering: true,
 			}
-			continue
-		}
-		// if header.OpCode.IsReserved() {
-		// 	continue
-		// }
-
-		// if !header.OpCode.IsData() {
-		// 	continue
-		// }
-
-		if header.OpCode&ws.OpText == 0 {
-			if err := reader.Discard(); err != nil {
+			if err := handler.Handle(header); err != nil {
+				if header.OpCode == ws.OpClose {
+					return 0, net.ErrClosed
+				}
 				return 0, err
 			}
+			if header.OpCode == ws.OpClose {
+				return 0, net.ErrClosed
+			}
 			continue
 		}
-
-		data := make([]byte, header.Length)
-
-		// Read until
-		_, err = io.ReadFull(c.Conn, data)
+		// RFC 7118 section 4.2 requires SIP WebSocket servers and clients to accept both UTF-8 text
+		// and binary messages. Reader.Read also joins continuation frames into this one message.
+		data, err := io.ReadAll(io.LimitReader(reader, int64(ParseMaxMessageLength)+1))
 		if err != nil {
-			return n, err
+			return 0, err
 		}
-
-		// if header.OpCode == ws.OpPing {
-		// 	f := ws.NewPongFrame(data)
-		// 	ws.WriteFrame(c.Conn, f)
-		// 	continue
-		// }
-
-		if header.Masked {
-			ws.Cipher(data, header.Mask, 0)
+		if len(data) > ParseMaxMessageLength || len(data) > len(b) {
+			return 0, ErrMessageTooLarge
 		}
-
-		// header.Masked = false
 		if SIPDebug {
 			logSIPRead("WS", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr().String(), data)
 		}
-
-		n += copy(b[n:], data)
-
-		if header.Fin {
-			break
-		}
+		return copy(b, data), nil
 	}
-
-	return n, nil
 }
 
 func (c *WSConnection) Write(b []byte) (n int, err error) {
